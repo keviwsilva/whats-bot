@@ -75,9 +75,6 @@ CATEGORIAS = {
     'educação': ['livro', 'curso', 'faculdade', 'escola', 'material', 'aula', 'workshop']
 }
 
-# Sistema de aprendizado de preferências do usuário
-PREFERENCIAS_USUARIO = {}
-
 # Função para categorizar automaticamente
 def categorizar_gasto(descricao):
     descricao = descricao.lower()
@@ -86,6 +83,21 @@ def categorizar_gasto(descricao):
             if palavra in descricao:
                 return categoria
     return "outros"
+
+# Função para formatar data (trata tanto datas simples quanto ISO completas)
+def formatar_data(data_str):
+    try:
+        # Tenta parse como data ISO completa (com hora)
+        if 'T' in data_str:
+            dt = datetime.fromisoformat(data_str.replace('Z', '+00:00'))
+            return dt.strftime("%d/%m/%Y")
+        else:
+            # Tenta parse como data simples (YYYY-MM-DD)
+            dt = datetime.strptime(data_str, "%Y-%m-%d")
+            return dt.strftime("%d/%m/%Y")
+    except (ValueError, AttributeError):
+        # Se falhar, retorna a string original
+        return data_str
 
 # Sistema de NLP avançado com múltiplas intenções
 def analisar_intencao(mensagem):
@@ -275,225 +287,233 @@ def gerar_recomendacoes(conn, numero):
 
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp_bot():
-    msg_recebida = request.form.get('Body')
-    numero = request.form.get('From')
-    resposta = MessagingResponse()
+    try:
+        msg_recebida = request.form.get('Body')
+        numero = request.form.get('From')
+        resposta = MessagingResponse()
 
-    conn = sqlite3.connect(db_file)
-    c = conn.cursor()
-    
-    # Processa a mensagem com NLP avançado
-    intencao = analisar_intencao(msg_recebida)
-    ultima_intencao, contexto = recuperar_contexto(numero)
-    
-    # Extrai valor e descrição se relevantes
-    valor = extrair_valor(msg_recebida)
-    descricao = extrair_descricao(msg_recebida)
-    
-    # Sistema de diálogo contextual
-    if intencao == "saudacao":
-        saudacoes = ["Olá! 👋", "Oi! 😊", "E aí! 👍", "Hello! 👋"]
-        resposta.message(f"{random.choice(saudacoes)} Sou seu assistente financeiro inteligente. Como posso ajudar?")
+        conn = sqlite3.connect(db_file)
+        c = conn.cursor()
         
-    elif intencao == "adicionar_gasto":
-        if valor:
-            categoria = categorizar_gasto(descricao) if descricao else "outros"
+        # Processa a mensagem com NLP avançado
+        intencao = analisar_intencao(msg_recebida)
+        ultima_intencao, contexto = recuperar_contexto(numero)
+        
+        # Extrai valor e descrição se relevantes
+        valor = extrair_valor(msg_recebida)
+        descricao = extrair_descricao(msg_recebida)
+        
+        # Sistema de diálogo contextual
+        if intencao == "saudacao":
+            saudacoes = ["Olá! 👋", "Oi! 😊", "E aí! 👍", "Hello! 👋"]
+            resposta.message(f"{random.choice(saudacoes)} Sou seu assistente financeiro inteligente. Como posso ajudar?")
             
-            if not descricao:
-                # Pede descrição se não foi fornecida
-                salvar_contexto(numero, "aguardando_descricao", {"valor": valor})
-                resposta.message(f"💵 Valor identificado: R$ {valor:.2f}. Por favor, digite a descrição deste gasto.")
+        elif intencao == "adicionar_gasto":
+            if valor:
+                categoria = categorizar_gasto(descricao) if descricao else "outros"
+                
+                if not descricao:
+                    # Pede descrição se não foi fornecida
+                    salvar_contexto(numero, "aguardando_descricao", {"valor": valor})
+                    resposta.message(f"💵 Valor identificado: R$ {valor:.2f}. Por favor, digite a descrição deste gasto.")
+                else:
+                    # Adiciona o gasto completo
+                    hoje = datetime.now().isoformat()
+                    c.execute("INSERT INTO gastos (valor, descricao, categoria, data) VALUES (?, ?, ?, ?)",
+                             (valor, descricao, categoria, hoje))
+                    conn.commit()
+                    
+                    # Gera insights após adicionar gasto
+                    insights = gerar_insights(conn, numero)
+                    msg_insights = "\n".join(insights) if insights else ""
+                    
+                    resposta.message(f"✅ Gasto de R$ {valor:.2f} adicionado em {categoria}: {descricao}\n\n{msg_insights}")
             else:
-                # Adiciona o gasto completo
-                hoje = datetime.now().isoformat()
-                c.execute("INSERT INTO gastos (valor, descricao, categoria, data) VALUES (?, ?, ?, ?)",
-                         (valor, descricao, categoria, hoje))
-                conn.commit()
-                
-                # Gera insights após adicionar gasto
-                insights = gerar_insights(conn, numero)
-                msg_insights = "\n".join(insights) if insights else ""
-                
-                resposta.message(f"✅ Gasto de R$ {valor:.2f} adicionado em {categoria}: {descricao}\n\n{msg_insights}")
-        else:
-            resposta.message("Não consegui identificar o valor. Por favor, digite algo como:\n'Gastei 50 reais no almoço'")
-    
-    elif intencao == "consultar_gastos":
-        c.execute("SELECT valor, descricao, categoria, data FROM gastos ORDER BY data DESC LIMIT 10")
-        gastos = c.fetchall()
+                resposta.message("Não consegui identificar o valor. Por favor, digite algo como:\n'Gastei 50 reais no almoço'")
         
-        if gastos:
-            msg = "📋 Seus últimos 10 gastos:\n\n"
-            total = 0
-            
-            for v, d, cat, dt in gastos:
-                data_formatada = datetime.strptime(dt, "%Y-%m-%d").strftime("%d/%m")
-                msg += f"• {data_formatada} | {cat} | R$ {v:.2f} - {d}\n"
-                total += v
-            
-            msg += f"\n💰 Total: R$ {total:.2f}"
-            resposta.message(msg)
-        else:
-            resposta.message("Nenhum gasto registrado ainda.")
-    
-    elif intencao == "resumo_financeiro":
-        # Resumo do mês atual
-        mes_atual = datetime.now().strftime("%Y-%m")
-        c.execute("SELECT SUM(valor) FROM gastos WHERE substr(data,1,7)=?", (mes_atual,))
-        total_mes = c.fetchone()[0] or 0
-        
-        # Gastos por categoria
-        c.execute("SELECT categoria, SUM(valor) FROM gastos WHERE substr(data,1,7)=? GROUP BY categoria", 
-                 (mes_atual,))
-        gastos_categorias = c.fetchall()
-        
-        msg = f"📊 Resumo Financeiro - {mes_atual}\n\n"
-        msg += f"💰 Total gasto: R$ {total_mes:.2f}\n\n"
-        
-        if gastos_categorias:
-            msg += "📈 Por categoria:\n"
-            for cat, val in gastos_categorias:
-                percentual = (val / total_mes * 100) if total_mes > 0 else 0
-                msg += f"• {cat}: R$ {val:.2f} ({percentual:.1f}%)\n"
-        
-        # Adiciona insights
-        insights = gerar_insights(conn, numero)
-        if insights:
-            msg += f"\n🔍 Insights:\n" + "\n".join(insights)
-        
-        resposta.message(msg)
-    
-    elif intencao == "buscar_gastos":
-        termos = re.sub(r'(buscar|procurar|encontrar|filtrar|pesquisar)', '', msg_recebida, flags=re.IGNORECASE)
-        termos = termos.strip()
-        
-        if termos:
-            c.execute("SELECT valor, descricao, categoria, data FROM gastos WHERE descricao LIKE ? OR categoria LIKE ? ORDER BY data DESC", 
-                     (f'%{termos}%', f'%{termos}%'))
+        elif intencao == "consultar_gastos":
+            c.execute("SELECT valor, descricao, categoria, data FROM gastos ORDER BY data DESC LIMIT 10")
             gastos = c.fetchall()
             
             if gastos:
-                msg = f"🔍 Gastos encontrados com '{termos}':\n\n"
+                msg = "📋 Seus últimos 10 gastos:\n\n"
                 total = 0
                 
                 for v, d, cat, dt in gastos:
-                    data_formatada = datetime.strptime(dt, "%Y-%m-%d").strftime("%d/%m")
+                    data_formatada = formatar_data(dt)
                     msg += f"• {data_formatada} | {cat} | R$ {v:.2f} - {d}\n"
                     total += v
                 
                 msg += f"\n💰 Total: R$ {total:.2f}"
                 resposta.message(msg)
             else:
-                resposta.message(f"Nenhum gasto encontrado com '{termos}'.")
-        else:
-            resposta.message("Por favor, digite o que deseja buscar. Ex: 'buscar gastos com mercado'")
-    
-    elif intencao == "analise_categoria":
-        c.execute("SELECT categoria, SUM(valor) FROM gastos GROUP BY categoria ORDER BY SUM(valor) DESC")
-        categorias = c.fetchall()
+                resposta.message("Nenhum gasto registrado ainda.")
         
-        if categorias:
-            msg = "📊 Análise por Categoria:\n\n"
-            total_geral = sum(val for _, val in categorias)
+        elif intencao == "resumo_financeiro":
+            # Resumo do mês atual
+            mes_atual = datetime.now().strftime("%Y-%m")
+            c.execute("SELECT SUM(valor) FROM gastos WHERE substr(data,1,7)=?", (mes_atual,))
+            total_mes = c.fetchone()[0] or 0
             
-            for cat, val in categorias:
-                percentual = (val / total_geral * 100) if total_geral > 0 else 0
-                msg += f"• {cat}: R$ {val:.2f} ({percentual:.1f}%)\n"
+            # Gastos por categoria
+            c.execute("SELECT categoria, SUM(valor) FROM gastos WHERE substr(data,1,7)=? GROUP BY categoria", 
+                     (mes_atual,))
+            gastos_categorias = c.fetchall()
+            
+            msg = f"📊 Resumo Financeiro - {mes_atual}\n\n"
+            msg += f"💰 Total gasto: R$ {total_mes:.2f}\n\n"
+            
+            if gastos_categorias:
+                msg += "📈 Por categoria:\n"
+                for cat, val in gastos_categorias:
+                    percentual = (val / total_mes * 100) if total_mes > 0 else 0
+                    msg += f"• {cat}: R$ {val:.2f} ({percentual:.1f}%)\n"
+            
+            # Adiciona insights
+            insights = gerar_insights(conn, numero)
+            if insights:
+                msg += f"\n🔍 Insights:\n" + "\n".join(insights)
             
             resposta.message(msg)
-        else:
-            resposta.message("Nenhum gasto registrado para análise.")
-    
-    elif intencao == "definir_orcamento":
-        # Extrai categoria e valor do orçamento
-        partes = msg_recebida.split()
-        try:
-            valor_orcamento = extrair_valor(msg_recebida)
-            categoria = None
-            
-            # Tenta identificar a categoria
-            for cat in CATEGORIAS.keys():
-                if cat in msg_recebida.lower():
-                    categoria = cat
-                    break
-            
-            if not categoria:
-                categoria = "outros"
-            
-            mes_ano = datetime.now().strftime("%Y-%m")
-            
-            # Verifica se já existe orçamento para esta categoria no mês
-            c.execute("SELECT id FROM orcamentos WHERE categoria=? AND mes_ano=?", (categoria, mes_ano))
-            existe = c.fetchone()
-            
-            if existe:
-                c.execute("UPDATE orcamentos SET limite_mensal=? WHERE categoria=? AND mes_ano=?", 
-                         (valor_orcamento, categoria, mes_ano))
-            else:
-                c.execute("INSERT INTO orcamentos (categoria, limite_mensal, mes_ano) VALUES (?, ?, ?)",
-                         (categoria, valor_orcamento, mes_ano))
-            
-            conn.commit()
-            resposta.message(f"✅ Orçamento de R$ {valor_orcamento:.2f} definido para {categoria} neste mês.")
-        except:
-            resposta.message("Formato inválido. Use: 'definir orçamento de 500 reais para alimentação'")
-    
-    elif intencao == "definir_meta":
-        # Implementação simplificada para metas
-        valor_meta = extrair_valor(msg_recebida)
         
-        if valor_meta:
-            # Extrai descrição da meta
-            desc_meta = re.sub(r'\d+[\.,]?\d*|r\$|reais|meta|objetivo', '', msg_recebida, flags=re.IGNORECASE)
-            desc_meta = desc_meta.strip()
+        elif intencao == "buscar_gastos":
+            termos = re.sub(r'(buscar|procurar|encontrar|filtrar|pesquisar)', '', msg_recebida, flags=re.IGNORECASE)
+            termos = termos.strip()
             
-            if not desc_meta:
-                desc_meta = "Economia"
+            if termos:
+                c.execute("SELECT valor, descricao, categoria, data FROM gastos WHERE descricao LIKE ? OR categoria LIKE ? ORDER BY data DESC", 
+                         (f'%{termos}%', f'%{termos}%'))
+                gastos = c.fetchall()
+                
+                if gastos:
+                    msg = f"🔍 Gastos encontrados com '{termos}':\n\n"
+                    total = 0
+                    
+                    for v, d, cat, dt in gastos:
+                        data_formatada = formatar_data(dt)
+                        msg += f"• {data_formatada} | {cat} | R$ {v:.2f} - {d}\n"
+                        total += v
+                    
+                    msg += f"\n💰 Total: R$ {total:.2f}"
+                    resposta.message(msg)
+                else:
+                    resposta.message(f"Nenhum gasto encontrado com '{termos}'.")
+            else:
+                resposta.message("Por favor, digite o que deseja buscar. Ex: 'buscar gastos com mercado'")
+        
+        elif intencao == "analise_categoria":
+            c.execute("SELECT categoria, SUM(valor) FROM gastos GROUP BY categoria ORDER BY SUM(valor) DESC")
+            categorias = c.fetchall()
             
-            data_limite = (datetime.now() + timedelta(days=30)).isoformat()  # 30 dias padrão
+            if categorias:
+                msg = "📊 Análise por Categoria:\n\n"
+                total_geral = sum(val for _, val in categorias)
+                
+                for cat, val in categorias:
+                    percentual = (val / total_geral * 100) if total_geral > 0 else 0
+                    msg += f"• {cat}: R$ {val:.2f} ({percentual:.1f}%)\n"
+                
+                resposta.message(msg)
+            else:
+                resposta.message("Nenhum gasto registrado para análise.")
+        
+        elif intencao == "definir_orcamento":
+            # Extrai categoria e valor do orçamento
+            partes = msg_recebida.split()
+            try:
+                valor_orcamento = extrair_valor(msg_recebida)
+                categoria = None
+                
+                # Tenta identificar a categoria
+                for cat in CATEGORIAS.keys():
+                    if cat in msg_recebida.lower():
+                        categoria = cat
+                        break
+                
+                if not categoria:
+                    categoria = "outros"
+                
+                mes_ano = datetime.now().strftime("%Y-%m")
+                
+                # Verifica se já existe orçamento para esta categoria no mês
+                c.execute("SELECT id FROM orcamentos WHERE categoria=? AND mes_ano=?", (categoria, mes_ano))
+                existe = c.fetchone()
+                
+                if existe:
+                    c.execute("UPDATE orcamentos SET limite_mensal=? WHERE categoria=? AND mes_ano=?", 
+                             (valor_orcamento, categoria, mes_ano))
+                else:
+                    c.execute("INSERT INTO orcamentos (categoria, limite_mensal, mes_ano) VALUES (?, ?, ?)",
+                             (categoria, valor_orcamento, mes_ano))
+                
+                conn.commit()
+                resposta.message(f"✅ Orçamento de R$ {valor_orcamento:.2f} definido para {categoria} neste mês.")
+            except Exception as e:
+                resposta.message("Formato inválido. Use: 'definir orçamento de 500 reais para alimentação'")
+        
+        elif intencao == "definir_meta":
+            # Implementação simplificada para metas
+            valor_meta = extrair_valor(msg_recebida)
             
-            c.execute("INSERT INTO metas (objetivo, valor_alvo, valor_atual, data_limite) VALUES (?, ?, ?, ?)",
-                     (desc_meta, valor_meta, 0, data_limite))
-            conn.commit()
-            
-            resposta.message(f"🎯 Meta definida: {desc_meta} - R$ {valor_meta:.2f}\n\nVocê pode acompanhar seu progresso a qualquer momento!")
+            if valor_meta:
+                # Extrai descrição da meta
+                desc_meta = re.sub(r'\d+[\.,]?\d*|r\$|reais|meta|objetivo', '', msg_recebida, flags=re.IGNORECASE)
+                desc_meta = desc_meta.strip()
+                
+                if not desc_meta:
+                    desc_meta = "Economia"
+                
+                data_limite = (datetime.now() + timedelta(days=30)).isoformat()  # 30 dias padrão
+                
+                c.execute("INSERT INTO metas (objetivo, valor_alvo, valor_atual, data_limite) VALUES (?, ?, ?, ?)",
+                         (desc_meta, valor_meta, 0, data_limite))
+                conn.commit()
+                
+                resposta.message(f"🎯 Meta definida: {desc_meta} - R$ {valor_meta:.2f}\n\nVocê pode acompanhar seu progresso a qualquer momento!")
+            else:
+                resposta.message("Por favor, especifique o valor da meta. Ex: 'quero economizar 1000 reais para uma viagem'")
+        
+        elif intencao == "recomendacao":
+            recomendacoes = gerar_recomendacoes(conn, numero)
+            msg = "💡 Recomendações Personalizadas:\n\n" + "\n".join(recomendacoes)
+            resposta.message(msg)
+        
+        elif intencao == "ajuda":
+            resposta.message(
+                "🤖 *Assistente Financeiro Inteligente* 🤖\n\n"
+                "💳 *Registrar Gastos:*\n"
+                "- 'Gastei 50 no almoço'\n- 'Adicionar 30 de transporte'\n- 'Comprei um livro por 25 reais'\n\n"
+                "📊 *Consultas e Análises:*\n"
+                "- 'Mostrar meus gastos'\n- 'Resumo financeiro'\n- 'Quanto gastei esse mês?'\n"
+                "- 'Onde gastei mais?'\n- 'Buscar gastos com mercado'\n\n"
+                "🎯 *Controle Financeiro:*\n"
+                "- 'Definir orçamento de 500 para alimentação'\n- 'Criar meta de 1000 reais'\n"
+                "- 'Recomendações para economizar'\n\n"
+                "💡 *Dica:* Você pode conversar naturalmente comigo!"
+            )
+        
         else:
-            resposta.message("Por favor, especifique o valor da meta. Ex: 'quero economizar 1000 reais para uma viagem'")
+            # Resposta para mensagens não reconhecidas
+            respostas_nao_reconhecidas = [
+                "Desculpe, não entendi. Pode reformular?",
+                "Não consegui processar sua solicitação. Pode tentar de outra forma?",
+                "Hmm, não sei como ajudar com isso. Que tal um comando diferente?",
+                "Interessante! Mas não tenho essa funcionalidade ainda."
+            ]
+            resposta.message(f"{random.choice(respostas_nao_reconhecidas)}\n\nDigite 'ajuda' para ver o que posso fazer.")
+        
+        # Salva o contexto da conversa
+        salvar_contexto(numero, intencao)
+        
+        conn.close()
+        return str(resposta)
     
-    elif intencao == "recomendacao":
-        recomendacoes = gerar_recomendacoes(conn, numero)
-        msg = "💡 Recomendações Personalizadas:\n\n" + "\n".join(recomendacoes)
-        resposta.message(msg)
-    
-    elif intencao == "ajuda":
-        resposta.message(
-            "🤖 *Assistente Financeiro Inteligente* 🤖\n\n"
-            "💳 *Registrar Gastos:*\n"
-            "- 'Gastei 50 no almoço'\n- 'Adicionar 30 de transporte'\n- 'Comprei um livro por 25 reais'\n\n"
-            "📊 *Consultas e Análises:*\n"
-            "- 'Mostrar meus gastos'\n- 'Resumo financeiro'\n- 'Quanto gastei esse mês?'\n"
-            "- 'Onde gastei mais?'\n- 'Buscar gastos com mercado'\n\n"
-            "🎯 *Controle Financeiro:*\n"
-            "- 'Definir orçamento de 500 para alimentação'\n- 'Criar meta de 1000 reais'\n"
-            "- 'Recomendações para economizar'\n\n"
-            "💡 *Dica:* Você pode conversar naturalmente comigo!"
-        )
-    
-    else:
-        # Resposta para mensagens não reconhecidas
-        respostas_nao_reconhecidas = [
-            "Desculpe, não entendi. Pode reformular?",
-            "Não consegui processar sua solicitação. Pode tentar de outra forma?",
-            "Hmm, não sei como ajudar com isso. Que tal um comando diferente?",
-            "Interessante! Mas não tenho essa funcionalidade ainda."
-        ]
-        resposta.message(f"{random.choice(respostas_nao_reconhecidas)}\n\nDigite 'ajuda' para ver o que posso fazer.")
-    
-    # Salva o contexto da conversa
-    salvar_contexto(numero, intencao)
-    
-    conn.close()
-    return str(resposta)
+    except Exception as e:
+        # Log do erro para debugging
+        print(f"Erro: {str(e)}")
+        resposta = MessagingResponse()
+        resposta.message("😕 Ocorreu um erro inesperado. Por favor, tente novamente.")
+        return str(resposta)
 
 if __name__ == "__main__":
     app.run(debug=True, port=5000)
