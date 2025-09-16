@@ -6,9 +6,10 @@ import datetime
 import re
 import json
 import random
-import math
-from collections import defaultdict
+import numpy as np
 from datetime import datetime, timedelta
+from collections import defaultdict
+import math
 
 app = Flask(__name__)
 db_file = "gastos_ml.db"
@@ -57,12 +58,30 @@ def init_db():
                  timestamp TEXT
                  )""")
     
+    # Tabela para aprendizado de ML
+    c.execute("""CREATE TABLE IF NOT EXISTS ml_model (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 tipo TEXT,
+                 parametros TEXT,
+                 precisao REAL,
+                 data_treinamento TEXT
+                 )""")
+    
+    # Tabela para padrões de gastos do usuário
+    c.execute("""CREATE TABLE IF NOT EXISTS padroes_usuario (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 padrao_type TEXT,
+                 padrao_dados TEXT,
+                 confianca REAL,
+                 ultima_atualizacao TEXT
+                 )""")
+    
     conn.commit()
     conn.close()
 
 init_db()
 
-# Sistema de ML para categorização (sem numpy)
+# Sistema de ML para categorização
 class CategorizadorML:
     def __init__(self):
         self.palavras_chave = defaultdict(lambda: defaultdict(int))
@@ -71,11 +90,11 @@ class CategorizadorML:
         
     def treinar_com_dados(self, conn):
         c = conn.cursor()
-        c.execute("SELECT descricao, categoria FROM gastos WHERE categoria IS NOT NULL AND categoria != 'outros'")
+        c.execute("SELECT descricao, categoria FROM gastos WHERE categoria IS NOT NULL")
         dados = c.fetchall()
         
         for descricao, categoria in dados:
-            palavras = re.findall(r'\w+', descricao.lower())
+            palavras = descricao.lower().split()
             for palavra in palavras:
                 if len(palavra) > 2:  # Ignora palavras muito curtas
                     self.palavras_chave[palavra][categoria] += 1
@@ -88,7 +107,7 @@ class CategorizadorML:
         if not self.modelo_treinado:
             return "outros"
         
-        palavras = re.findall(r'\w+', descricao.lower())
+        palavras = descricao.lower().split()
         scores = defaultdict(float)
         
         for palavra in palavras:
@@ -105,7 +124,7 @@ class CategorizadorML:
                 return max(self.categorias_padrao.items(), key=lambda x: x[1])[0]
             return "outros"
 
-# Sistema de previsão de gastos (sem numpy)
+# Sistema de previsão de gastos
 class PredictorML:
     def __init__(self):
         self.historico_gastos = []
@@ -120,10 +139,7 @@ class PredictorML:
         self.historico_gastos = []
         for valor, data_str in dados:
             try:
-                if 'T' in data_str:
-                    data = datetime.fromisoformat(data_str.replace('Z', '+00:00'))
-                else:
-                    data = datetime.strptime(data_str, "%Y-%m-%d")
+                data = datetime.strptime(data_str.split('T')[0], "%Y-%m-%d")
                 self.historico_gastos.append((data, valor))
             except:
                 continue
@@ -138,23 +154,19 @@ class PredictorML:
         # Calcula tendência (últimos 7 dias vs anteriores 7 dias)
         if len(self.historico_gastos) >= 14:
             anteriores_7_dias = [v for d, v in self.historico_gastos[-14:-7]]
-            if anteriores_7_dias and len(anteriores_7_dias) > 0:
-                media_anteriores = sum(anteriores_7_dias) / len(anteriores_7_dias)
-                if media_anteriores > 0:
-                    self.tendencia = ((self.media_movel - media_anteriores) / media_anteriores) * 100
-                else:
-                    self.tendencia = 0
+            media_anteriores = sum(anteriores_7_dias) / len(anteriores_7_dias)
+            self.tendencia = ((self.media_movel - media_anteriores) / media_anteriores) * 100 if media_anteriores > 0 else 0
         
         return True
     
     def prever_proximos_dias(self, dias=7):
         if not self.historico_gastos:
-            return None, 0
+            return None
             
         previsao = self.media_movel * dias
         return previsao, self.tendencia
 
-# Sistema de recomendação inteligente (sem numpy)
+# Sistema de recomendação inteligente
 class RecomendadorML:
     def __init__(self):
         self.padroes_gastos = defaultdict(list)
@@ -162,17 +174,12 @@ class RecomendadorML:
         
     def analisar_padroes(self, conn):
         c = conn.cursor()
-        self.padroes_gastos.clear()
         
         # Padrões por dia da semana
         c.execute("SELECT valor, data FROM gastos")
-        dados_gastos = c.fetchall()
-        for valor, data_str in dados_gastos:
+        for valor, data_str in dados:
             try:
-                if 'T' in data_str:
-                    data = datetime.fromisoformat(data_str.replace('Z', '+00:00'))
-                else:
-                    data = datetime.strptime(data_str, "%Y-%m-%d")
+                data = datetime.strptime(data_str.split('T')[0], "%Y-%m-%d")
                 dia_semana = data.weekday()
                 self.padroes_gastos['dia_semana'].append((dia_semana, valor))
             except:
@@ -213,21 +220,11 @@ class RecomendadorML:
                 if len(gastos) > 5:  # Padrão significativo
                     total = sum(gastos)
                     self.recomendacoes.append(
-                        f"💡 Você já gastou R$ {total:.2f} com {categoria}"
+                        f"💡 Você já gastou R$ {total:.2f} com {categoria} este mês"
                     )
-        
-        # Recomendações gerais
-        self.recomendacoes.extend([
-            "💡 Considere fazer um orçamento mensal para controlar melhor seus gastos",
-            "💡 Revise assinaturas e serviços recorrentes regularmente",
-            "💡 Compare preços antes de compras importantes",
-            "💡 Estabeleça metas financeiras para manter o foco"
-        ])
     
     def obter_recomendacoes(self, limite=3):
-        if not self.recomendacoes:
-            return []
-        return random.sample(self.recomendacoes, min(limite, len(self.recomendacoes)))
+        return random.sample(self.recomendacoes, min(limite, len(self.recomendacoes))) if self.recomendacoes else []
 
 # Instâncias dos modelos ML
 categorizador_ml = CategorizadorML()
@@ -247,32 +244,43 @@ def formatar_data(data_str):
         return data_str
 
 # Sistema de NLP avançado com ML
-def analisar_intencao(mensagem, historico=None):
+def analisar_intencao_com_ml(mensagem, historico=None):
     mensagem = mensagem.lower().strip()
     
     # Padrões com pesos baseados em aprendizado
     padroes = {
-        'saudacao': r'\b(oi|olá|ola|eae|hey|hello|como vai|tudo bem)\b',
-        'adicionar_gasto': r'\b(gastei|gasto|gastar|adicionar|add|registrar|comprei|paguei|investi|r\$|reais|valor|preço)\b',
-        'consultar_gastos': r'\b(ver|mostrar|listar|consultar|visualizar|gastos|despesas|compras)\b',
-        'resumo_financeiro': r'\b(total|soma|resumo|quanto gastei|extrato|finanças|financeiro)\b',
-        'buscar_gastos': r'\b(buscar|procurar|encontrar|filtrar|pesquisar|onde gastei)\b',
-        'definir_orcamento': r'\b(orçamento|orcamento|limite|definir|estabelecer|máximo|controlar)\b',
-        'definir_meta': r'\b(meta|objetivo|poupar|economizar|guardar|sonho|conseguir|alcançar)\b',
-        'analise_categoria': r'\b(categoria|categorias|por tipo|por área|onde mais gasto)\b',
-        'previsao_gastos': r'\b(previsão|previsao|futuro|próximo|próximos|esperar|projeção)\b',
-        'comparativo_mensal': r'\b(comparar|mês|meses|variação|variaçao|evolução|evolucao)\b',
-        'recomendacao': r'\b(dica|sugestão|sugestao|recomendação|recomendacao|como economizar|economia)\b',
-        'remover_gasto': r'\b(remover|excluir|deletar|apagar|eliminar|retirar|cancelar)\b',
-        'configuracao': r'\b(configurar|preferências|preferencias|alterar|mudar|personalizar)\b',
-        'treinar_ml': r'\b(treinar|aprender|melhorar|atualizar|inteligencia|ia|ml|machine learning)\b',
-        'ajuda': r'\b(ajuda|help|comandos|o que você faz|funcionalidades|como usar)\b'
+        'saudacao': (r'\b(oi|olá|ola|eae|hey|hello|como vai|tudo bem)\b', 0.95),
+        'adicionar_gasto': (r'\b(gastei|gasto|gastar|adicionar|add|registrar|comprei|paguei|investi|r\$|reais|valor|preço)\b', 0.90),
+        'consultar_gastos': (r'\b(ver|mostrar|listar|consultar|visualizar|gastos|despesas|compras)\b', 0.85),
+        'resumo_financeiro': (r'\b(total|soma|resumo|quanto gastei|extrato|finanças|financeiro)\b', 0.88),
+        'buscar_gastos': (r'\b(buscar|procurar|encontrar|filtrar|pesquisar|onde gastei)\b', 0.82),
+        'definir_orcamento': (r'\b(orçamento|orcamento|limite|definir|estabelecer|máximo|controlar)\b', 0.80),
+        'definir_meta': (r'\b(meta|objetivo|poupar|economizar|guardar|sonho|conseguir|alcançar)\b', 0.78),
+        'analise_categoria': (r'\b(categoria|categorias|por tipo|por área|onde mais gasto)\b', 0.75),
+        'previsao_gastos': (r'\b(previsão|previsao|futuro|próximo|próximos|esperar|projeção)\b', 0.77),
+        'comparativo_mensal': (r'\b(comparar|mês|meses|variação|variaçao|evolução|evolucao)\b', 0.76),
+        'recomendacao': (r'\b(dica|sugestão|sugestao|recomendação|recomendacao|como economizar|economia)\b', 0.72),
+        'remover_gasto': (r'\b(remover|excluir|deletar|apagar|eliminar|retirar|cancelar)\b', 0.85),
+        'configuracao': (r'\b(configurar|preferências|preferencias|alterar|mudar|personalizar)\b', 0.70),
+        'treinar_ml': (r'\b(treinar|aprender|melhorar|atualizar|inteligencia|ia|ml|machine learning)\b', 0.65),
+        'ajuda': (r'\b(ajuda|help|comandos|o que você faz|funcionalidades|como usar)\b', 0.90)
     }
     
-    # Verifica correspondências
-    for intencao, padrao in padroes.items():
+    # Verifica correspondências com pesos
+    correspondencias = []
+    for intencao, (padrao, peso) in padroes.items():
         if re.search(padrao, mensagem, re.IGNORECASE):
-            return intencao
+            # Ajusta peso baseado no histórico do usuário
+            peso_ajustado = peso
+            if historico and intencao in historico:
+                # Aumenta peso para intenções frequentes
+                peso_ajustado *= 1.2
+            
+            correspondencias.append((intencao, peso_ajustado))
+    
+    if correspondencias:
+        # Retorna a intenção com maior peso
+        return max(correspondencias, key=lambda x: x[1])[0]
     
     # Fallback: detecta se há valor numérico (provavelmente adicionar gasto)
     if any(char.isdigit() for char in mensagem) and ('r$' in mensagem or 'reais' in mensagem):
@@ -439,7 +447,7 @@ def whatsapp_bot():
         historico_intencoes = [row[0] for row in c.fetchall() if row[0]]
         
         # Processa a mensagem com ML
-        intencao = analisar_intencao(msg_recebida, historico_intencoes)
+        intencao = analisar_intencao_com_ml(msg_recebida, historico_intencoes)
         ultima_intencao, contexto = recuperar_contexto(numero)
         
         # Extrai dados da mensagem
