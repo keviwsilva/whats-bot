@@ -117,6 +117,7 @@ def analisar_intencao(mensagem):
         'comparativo_mensal': r'\b(comparar|mês|meses|variação|variaçao|evolução|evolucao)\b',
         'recomendacao': r'\b(dica|sugestão|sugestao|recomendação|recomendacao|como economizar|economia)\b',
         'configuracao': r'\b(configurar|preferências|preferencias|alterar|mudar|personalizar)\b',
+        'remover_gasto': r'\b(remover|excluir|deletar|apagar|eliminar|retirar|cancelar)\b',
         'ajuda': r'\b(ajuda|help|comandos|o que você faz|funcionalidades|como usar)\b'
     }
     
@@ -165,6 +166,28 @@ def extrair_descricao(texto):
     
     return ' '.join(palavras) if palavras else None
 
+# Função para extrair ID de gasto para remoção
+def extrair_id_remocao(texto):
+    # Procura por padrões como "remover 1", "excluir id 5", etc.
+    padroes = [
+        r'remover\s+(\d+)',
+        r'excluir\s+(\d+)',
+        r'deletar\s+(\d+)',
+        r'apagar\s+(\d+)',
+        r'id\s+(\d+)',
+        r'#(\d+)',
+        r'(\d+)$'
+    ]
+    
+    for padrao in padroes:
+        correspondencias = re.findall(padrao, texto, re.IGNORECASE)
+        if correspondencias:
+            try:
+                return int(correspondencias[0])
+            except:
+                continue
+    return None
+
 # Função para salvar contexto da conversa
 def salvar_contexto(numero, intencao, dados=None):
     conn = sqlite3.connect(db_file)
@@ -201,6 +224,29 @@ def recuperar_contexto(numero):
         dados = json.loads(dados_json) if dados_json else None
         return intencao, dados
     return None, None
+
+# Função para listar gastos com IDs para remoção
+def listar_gastos_para_remocao(conn, limite=10):
+    c = conn.cursor()
+    c.execute("SELECT id, valor, descricao, categoria, data FROM gastos ORDER BY data DESC, id DESC LIMIT ?", (limite,))
+    gastos = c.fetchall()
+    return gastos
+
+# Função para remover gasto por ID
+def remover_gasto(conn, id_gasto):
+    c = conn.cursor()
+    
+    # Primeiro verifica se o gasto existe
+    c.execute("SELECT id, valor, descricao FROM gastos WHERE id = ?", (id_gasto,))
+    gasto = c.fetchone()
+    
+    if gasto:
+        # Remove o gasto
+        c.execute("DELETE FROM gastos WHERE id = ?", (id_gasto,))
+        conn.commit()
+        return True, gasto
+    else:
+        return False, None
 
 # Sistema de análise e insights
 def gerar_insights(conn, numero):
@@ -271,7 +317,7 @@ def gerar_recomendacoes(conn, numero):
     gastos_frequentes = c.fetchall()
     
     if gastos_frequentes:
-        recomendacoes.append("💡 Você tem alguns gastos muito frequentes. Avalie se são realmente necessários")
+        recomendacoes.append("💡 Você tem alguns gastos muito frequentes. Avalie si são realmente necessários")
     
     # Sugestões genéricas
     sugestoes = [
@@ -332,19 +378,20 @@ def whatsapp_bot():
                 resposta.message("Não consegui identificar o valor. Por favor, digite algo como:\n'Gastei 50 reais no almoço'")
         
         elif intencao == "consultar_gastos":
-            c.execute("SELECT valor, descricao, categoria, data FROM gastos ORDER BY data DESC LIMIT 10")
+            c.execute("SELECT id, valor, descricao, categoria, data FROM gastos ORDER BY data DESC, id DESC LIMIT 10")
             gastos = c.fetchall()
             
             if gastos:
                 msg = "📋 Seus últimos 10 gastos:\n\n"
                 total = 0
                 
-                for v, d, cat, dt in gastos:
+                for id_gasto, v, d, cat, dt in gastos:
                     data_formatada = formatar_data(dt)
-                    msg += f"• {data_formatada} | {cat} | R$ {v:.2f} - {d}\n"
+                    msg += f"• #{id_gasto} | {data_formatada} | {cat} | R$ {v:.2f} - {d}\n"
                     total += v
                 
                 msg += f"\n💰 Total: R$ {total:.2f}"
+                msg += f"\n\n🗑️ Para remover um gasto, digite 'remover X' (onde X é o número do gasto)"
                 resposta.message(msg)
             else:
                 resposta.message("Nenhum gasto registrado ainda.")
@@ -381,7 +428,7 @@ def whatsapp_bot():
             termos = termos.strip()
             
             if termos:
-                c.execute("SELECT valor, descricao, categoria, data FROM gastos WHERE descricao LIKE ? OR categoria LIKE ? ORDER BY data DESC", 
+                c.execute("SELECT id, valor, descricao, categoria, data FROM gastos WHERE descricao LIKE ? OR categoria LIKE ? ORDER BY data DESC", 
                          (f'%{termos}%', f'%{termos}%'))
                 gastos = c.fetchall()
                 
@@ -389,12 +436,13 @@ def whatsapp_bot():
                     msg = f"🔍 Gastos encontrados com '{termos}':\n\n"
                     total = 0
                     
-                    for v, d, cat, dt in gastos:
+                    for id_gasto, v, d, cat, dt in gastos:
                         data_formatada = formatar_data(dt)
-                        msg += f"• {data_formatada} | {cat} | R$ {v:.2f} - {d}\n"
+                        msg += f"• #{id_gasto} | {data_formatada} | {cat} | R$ {v:.2f} - {d}\n"
                         total += v
                     
                     msg += f"\n💰 Total: R$ {total:.2f}"
+                    msg += f"\n\n🗑️ Para remover um gasto, digite 'remover X' (onde X é o número do gasto)"
                     resposta.message(msg)
                 else:
                     resposta.message(f"Nenhum gasto encontrado com '{termos}'.")
@@ -416,6 +464,35 @@ def whatsapp_bot():
                 resposta.message(msg)
             else:
                 resposta.message("Nenhum gasto registrado para análise.")
+        
+        elif intencao == "remover_gasto":
+            # Tenta extrair o ID do gasto a ser removido
+            id_gasto = extrair_id_remocao(msg_recebida)
+            
+            if id_gasto:
+                # Tenta remover o gasto
+                sucesso, gasto = remover_gasto(conn, id_gasto)
+                
+                if sucesso:
+                    id_removido, valor_removido, descricao_removida = gasto
+                    resposta.message(f"🗑️ Gasto removido com sucesso!\n\nID: #{id_removido}\nValor: R$ {valor_removido:.2f}\nDescrição: {descricao_removida}")
+                else:
+                    resposta.message(f"❌ Não foi encontrado nenhum gasto com o ID #{id_gasto}.\n\nDigite 'listar' para ver seus gastos disponíveis.")
+            else:
+                # Se não encontrou ID, lista os gastos para o usuário escolher
+                gastos = listar_gastos_para_remocao(conn)
+                
+                if gastos:
+                    msg = "📋 Seus últimos gastos (com IDs):\n\n"
+                    
+                    for id_gasto, v, d, cat, dt in gastos:
+                        data_formatada = formatar_data(dt)
+                        msg += f"• #{id_gasto} | {data_formatada} | {cat} | R$ {v:.2f} - {d}\n"
+                    
+                    msg += f"\n🗑️ Para remover um gasto, digite 'remover X' (onde X é o número do gasto)"
+                    resposta.message(msg)
+                else:
+                    resposta.message("Nenhum gasto registrado para remover.")
         
         elif intencao == "definir_orcamento":
             # Extrai categoria e valor do orçamento
@@ -486,6 +563,8 @@ def whatsapp_bot():
                 "📊 *Consultas e Análises:*\n"
                 "- 'Mostrar meus gastos'\n- 'Resumo financeiro'\n- 'Quanto gastei esse mês?'\n"
                 "- 'Onde gastei mais?'\n- 'Buscar gastos com mercado'\n\n"
+                "🗑️ *Gerenciar Gastos:*\n"
+                "- 'Remover gasto 5'\n- 'Excluir gasto 3'\n- 'Listar gastos'\n\n"
                 "🎯 *Controle Financeiro:*\n"
                 "- 'Definir orçamento de 500 para alimentação'\n- 'Criar meta de 1000 reais'\n"
                 "- 'Recomendações para economizar'\n\n"
