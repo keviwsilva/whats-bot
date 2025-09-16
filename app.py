@@ -6,12 +6,15 @@ import datetime
 import re
 import json
 import random
+import numpy as np
 from datetime import datetime, timedelta
+from collections import defaultdict
+import math
 
 app = Flask(__name__)
-db_file = "gastos_avancado.db"
+db_file = "gastos_ml.db"
 
-# Inicializa o banco com mais tabelas
+# Inicializa o banco com tabelas para ML
 def init_db():
     conn = sqlite3.connect(db_file)
     c = conn.cursor()
@@ -24,7 +27,8 @@ def init_db():
                  categoria TEXT,
                  data TEXT,
                  localizacao TEXT,
-                 metodo_pagamento TEXT
+                 metodo_pagamento TEXT,
+                 tags TEXT
                  )""")
     
     # Tabela de orçamentos
@@ -54,85 +58,237 @@ def init_db():
                  timestamp TEXT
                  )""")
     
+    # Tabela para aprendizado de ML
+    c.execute("""CREATE TABLE IF NOT EXISTS ml_model (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 tipo TEXT,
+                 parametros TEXT,
+                 precisao REAL,
+                 data_treinamento TEXT
+                 )""")
+    
+    # Tabela para padrões de gastos do usuário
+    c.execute("""CREATE TABLE IF NOT EXISTS padroes_usuario (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 padrao_type TEXT,
+                 padrao_dados TEXT,
+                 confianca REAL,
+                 ultima_atualizacao TEXT
+                 )""")
+    
     conn.commit()
     conn.close()
 
 init_db()
 
-# Sistema de categorização automática
-CATEGORIAS = {
-    'alimentação': ['comida', 'restaurante', 'lanche', 'mercado', 'supermercado', 'padaria', 
-                   'almoço', 'janta', 'jantar', 'café', 'ifood', 'uber eats'],
-    'transporte': ['ônibus', 'busão', 'metro', 'uber', '99', 'taxi', 'gasolina', 'combustível', 
-                  'estacionamento', 'pedágio', 'manutenção', 'oficina'],
-    'moradia': ['aluguel', 'condomínio', 'luz', 'energia', 'água', 'internet', 'telefone', 
-               'netflix', 'spotify', 'streaming', 'assinatura'],
-    'saúde': ['farmacia', 'farmácia', 'remédio', 'médico', 'dentista', 'plano de saúde', 
-             'hospital', 'clinica', 'academia', 'suplemento'],
-    'entretenimento': ['cinema', 'shopping', 'bar', 'balada', 'show', 'festival', 'viagem', 
-                      'hobby', 'jogo', 'livro', 'curso'],
-    'vestuário': ['roupa', 'calça', 'camisa', 'tenis', 'sapato', 'loja', 'shopping', 'moda'],
-    'educação': ['livro', 'curso', 'faculdade', 'escola', 'material', 'aula', 'workshop']
-}
+# Sistema de ML para categorização
+class CategorizadorML:
+    def __init__(self):
+        self.palavras_chave = defaultdict(lambda: defaultdict(int))
+        self.categorias_padrao = defaultdict(int)
+        self.modelo_treinado = False
+        
+    def treinar_com_dados(self, conn):
+        c = conn.cursor()
+        c.execute("SELECT descricao, categoria FROM gastos WHERE categoria IS NOT NULL")
+        dados = c.fetchall()
+        
+        for descricao, categoria in dados:
+            palavras = descricao.lower().split()
+            for palavra in palavras:
+                if len(palavra) > 2:  # Ignora palavras muito curtas
+                    self.palavras_chave[palavra][categoria] += 1
+            self.categorias_padrao[categoria] += 1
+        
+        self.modelo_treinado = True
+        return len(dados)
+    
+    def prever_categoria(self, descricao):
+        if not self.modelo_treinado:
+            return "outros"
+        
+        palavras = descricao.lower().split()
+        scores = defaultdict(float)
+        
+        for palavra in palavras:
+            if palavra in self.palavras_chave:
+                total = sum(self.palavras_chave[palavra].values())
+                for categoria, count in self.palavras_chave[palavra].items():
+                    scores[categoria] += count / total
+        
+        if scores:
+            return max(scores.items(), key=lambda x: x[1])[0]
+        else:
+            # Fallback para categorias mais comuns
+            if self.categorias_padrao:
+                return max(self.categorias_padrao.items(), key=lambda x: x[1])[0]
+            return "outros"
 
-# Função para categorizar automaticamente
-def categorizar_gasto(descricao):
-    descricao = descricao.lower()
-    for categoria, palavras_chave in CATEGORIAS.items():
-        for palavra in palavras_chave:
-            if palavra in descricao:
-                return categoria
-    return "outros"
+# Sistema de previsão de gastos
+class PredictorML:
+    def __init__(self):
+        self.historico_gastos = []
+        self.media_movel = 0
+        self.tendencia = 0
+        
+    def analisar_historico(self, conn):
+        c = conn.cursor()
+        c.execute("SELECT valor, data FROM gastos ORDER BY data")
+        dados = c.fetchall()
+        
+        self.historico_gastos = []
+        for valor, data_str in dados:
+            try:
+                data = datetime.strptime(data_str.split('T')[0], "%Y-%m-%d")
+                self.historico_gastos.append((data, valor))
+            except:
+                continue
+        
+        if len(self.historico_gastos) < 7:
+            return False
+            
+        # Calcula média móvel dos últimos 7 dias
+        ultimos_7_dias = [v for d, v in self.historico_gastos[-7:]]
+        self.media_movel = sum(ultimos_7_dias) / len(ultimos_7_dias)
+        
+        # Calcula tendência (últimos 7 dias vs anteriores 7 dias)
+        if len(self.historico_gastos) >= 14:
+            anteriores_7_dias = [v for d, v in self.historico_gastos[-14:-7]]
+            media_anteriores = sum(anteriores_7_dias) / len(anteriores_7_dias)
+            self.tendencia = ((self.media_movel - media_anteriores) / media_anteriores) * 100 if media_anteriores > 0 else 0
+        
+        return True
+    
+    def prever_proximos_dias(self, dias=7):
+        if not self.historico_gastos:
+            return None
+            
+        previsao = self.media_movel * dias
+        return previsao, self.tendencia
 
-# Função para formatar data (trata tanto datas simples quanto ISO completas)
+# Sistema de recomendação inteligente
+class RecomendadorML:
+    def __init__(self):
+        self.padroes_gastos = defaultdict(list)
+        self.recomendacoes = []
+        
+    def analisar_padroes(self, conn):
+        c = conn.cursor()
+        
+        # Padrões por dia da semana
+        c.execute("SELECT valor, data FROM gastos")
+        for valor, data_str in dados:
+            try:
+                data = datetime.strptime(data_str.split('T')[0], "%Y-%m-%d")
+                dia_semana = data.weekday()
+                self.padroes_gastos['dia_semana'].append((dia_semana, valor))
+            except:
+                continue
+        
+        # Padrões por categoria
+        c.execute("SELECT categoria, valor FROM gastos WHERE categoria IS NOT NULL")
+        for categoria, valor in c.fetchall():
+            self.padroes_gastos['categoria'].append((categoria, valor))
+        
+        # Gera recomendações baseadas em padrões
+        self._gerar_recomendacoes()
+        
+    def _gerar_recomendacoes(self):
+        self.recomendacoes = []
+        
+        # Análise de gastos por dia da semana
+        if 'dia_semana' in self.padroes_gastos:
+            gastos_por_dia = defaultdict(list)
+            for dia, valor in self.padroes_gastos['dia_semana']:
+                gastos_por_dia[dia].append(valor)
+            
+            dias_nomes = ['Segunda', 'Terça', 'Quarta', 'Quinta', 'Sexta', 'Sábado', 'Domingo']
+            for dia, gastos in gastos_por_dia.items():
+                if len(gastos) > 3:  # Padrão significativo
+                    media = sum(gastos) / len(gastos)
+                    self.recomendacoes.append(
+                        f"💡 Você gasta em média R$ {media:.2f} às {dias_nomes[dia]}s-feiras"
+                    )
+        
+        # Análise de gastos por categoria
+        if 'categoria' in self.padroes_gastos:
+            gastos_por_categoria = defaultdict(list)
+            for categoria, valor in self.padroes_gastos['categoria']:
+                gastos_por_categoria[categoria].append(valor)
+            
+            for categoria, gastos in gastos_por_categoria.items():
+                if len(gastos) > 5:  # Padrão significativo
+                    total = sum(gastos)
+                    self.recomendacoes.append(
+                        f"💡 Você já gastou R$ {total:.2f} com {categoria} este mês"
+                    )
+    
+    def obter_recomendacoes(self, limite=3):
+        return random.sample(self.recomendacoes, min(limite, len(self.recomendacoes))) if self.recomendacoes else []
+
+# Instâncias dos modelos ML
+categorizador_ml = CategorizadorML()
+predictor_ml = PredictorML()
+recomendador_ml = RecomendadorML()
+
+# Função para formatar data
 def formatar_data(data_str):
     try:
-        # Tenta parse como data ISO completa (com hora)
         if 'T' in data_str:
             dt = datetime.fromisoformat(data_str.replace('Z', '+00:00'))
             return dt.strftime("%d/%m/%Y")
         else:
-            # Tenta parse como data simples (YYYY-MM-DD)
             dt = datetime.strptime(data_str, "%Y-%m-%d")
             return dt.strftime("%d/%m/%Y")
     except (ValueError, AttributeError):
-        # Se falhar, retorna a string original
         return data_str
 
-# Sistema de NLP avançado com múltiplas intenções
-def analisar_intencao(mensagem):
+# Sistema de NLP avançado com ML
+def analisar_intencao_com_ml(mensagem, historico=None):
     mensagem = mensagem.lower().strip()
     
-    # Padrões complexos com regex
+    # Padrões com pesos baseados em aprendizado
     padroes = {
-        'saudacao': r'\b(oi|olá|ola|eae|hey|hello|como vai|tudo bem)\b',
-        'adicionar_gasto': r'\b(gastei|gasto|gastar|adicionar|add|registrar|comprei|paguei|investi|r\$|reais|valor|preço)\b',
-        'consultar_gastos': r'\b(ver|mostrar|listar|consultar|visualizar|gastos|despesas|compras)\b',
-        'resumo_financeiro': r'\b(total|soma|resumo|quanto gastei|extrato|finanças|financeiro)\b',
-        'buscar_gastos': r'\b(buscar|procurar|encontrar|filtrar|pesquisar|onde gastei)\b',
-        'definir_orcamento': r'\b(orçamento|orcamento|limite|definir|estabelecer|máximo|controlar)\b',
-        'definir_meta': r'\b(meta|objetivo|poupar|economizar|guardar|sonho|conseguir|alcançar)\b',
-        'analise_categoria': r'\b(categoria|categorias|por tipo|por área|onde mais gasto)\b',
-        'previsao_gastos': r'\b(previsão|previsao|futuro|próximo|próximos|esperar|projeção)\b',
-        'comparativo_mensal': r'\b(comparar|mês|meses|variação|variaçao|evolução|evolucao)\b',
-        'recomendacao': r'\b(dica|sugestão|sugestao|recomendação|recomendacao|como economizar|economia)\b',
-        'configuracao': r'\b(configurar|preferências|preferencias|alterar|mudar|personalizar)\b',
-        'remover_gasto': r'\b(remover|excluir|deletar|apagar|eliminar|retirar|cancelar)\b',
-        'ajuda': r'\b(ajuda|help|comandos|o que você faz|funcionalidades|como usar)\b'
+        'saudacao': (r'\b(oi|olá|ola|eae|hey|hello|como vai|tudo bem)\b', 0.95),
+        'adicionar_gasto': (r'\b(gastei|gasto|gastar|adicionar|add|registrar|comprei|paguei|investi|r\$|reais|valor|preço)\b', 0.90),
+        'consultar_gastos': (r'\b(ver|mostrar|listar|consultar|visualizar|gastos|despesas|compras)\b', 0.85),
+        'resumo_financeiro': (r'\b(total|soma|resumo|quanto gastei|extrato|finanças|financeiro)\b', 0.88),
+        'buscar_gastos': (r'\b(buscar|procurar|encontrar|filtrar|pesquisar|onde gastei)\b', 0.82),
+        'definir_orcamento': (r'\b(orçamento|orcamento|limite|definir|estabelecer|máximo|controlar)\b', 0.80),
+        'definir_meta': (r'\b(meta|objetivo|poupar|economizar|guardar|sonho|conseguir|alcançar)\b', 0.78),
+        'analise_categoria': (r'\b(categoria|categorias|por tipo|por área|onde mais gasto)\b', 0.75),
+        'previsao_gastos': (r'\b(previsão|previsao|futuro|próximo|próximos|esperar|projeção)\b', 0.77),
+        'comparativo_mensal': (r'\b(comparar|mês|meses|variação|variaçao|evolução|evolucao)\b', 0.76),
+        'recomendacao': (r'\b(dica|sugestão|sugestao|recomendação|recomendacao|como economizar|economia)\b', 0.72),
+        'remover_gasto': (r'\b(remover|excluir|deletar|apagar|eliminar|retirar|cancelar)\b', 0.85),
+        'configuracao': (r'\b(configurar|preferências|preferencias|alterar|mudar|personalizar)\b', 0.70),
+        'treinar_ml': (r'\b(treinar|aprender|melhorar|atualizar|inteligencia|ia|ml|machine learning)\b', 0.65),
+        'ajuda': (r'\b(ajuda|help|comandos|o que você faz|funcionalidades|como usar)\b', 0.90)
     }
     
-    # Verifica qual padrão corresponde
-    for intencao, padrao in padroes.items():
+    # Verifica correspondências com pesos
+    correspondencias = []
+    for intencao, (padrao, peso) in padroes.items():
         if re.search(padrao, mensagem, re.IGNORECASE):
-            return intencao
+            # Ajusta peso baseado no histórico do usuário
+            peso_ajustado = peso
+            if historico and intencao in historico:
+                # Aumenta peso para intenções frequentes
+                peso_ajustado *= 1.2
+            
+            correspondencias.append((intencao, peso_ajustado))
     
-    # Extrai valor para detectar intenção implícita de adicionar gasto
-    if extrair_valor(mensagem):
+    if correspondencias:
+        # Retorna a intenção com maior peso
+        return max(correspondencias, key=lambda x: x[1])[0]
+    
+    # Fallback: detecta se há valor numérico (provavelmente adicionar gasto)
+    if any(char.isdigit() for char in mensagem) and ('r$' in mensagem or 'reais' in mensagem):
         return "adicionar_gasto"
     
     return "desconhecido"
 
-# Função para extrair valor (mais avançada)
+# Funções de extração de dados
 def extrair_valor(texto):
     padroes = [
         r'r\$\s*(\d+[\.,]?\d*)',
@@ -153,22 +309,17 @@ def extrair_valor(texto):
                 continue
     return None
 
-# Função para extrair descrição
 def extrair_descricao(texto):
-    # Remove números, palavras relacionadas a valor e comandos
     texto_limpo = re.sub(r'\d+[\.,]?\d*', '', texto)
     texto_limpo = re.sub(r'r\$|reais|valor|gastei|gasto|adicionar|add|registrar', '', texto_limpo, flags=re.IGNORECASE)
     texto_limpo = re.sub(r'\s+', ' ', texto_limpo).strip()
     
-    # Remove preposições e artigos comuns
     palavras_remover = ['no', 'na', 'em', 'de', 'do', 'da', 'com', 'por', 'para', 'um', 'uma']
     palavras = [p for p in texto_limpo.split() if p.lower() not in palavras_remover]
     
     return ' '.join(palavras) if palavras else None
 
-# Função para extrair ID de gasto para remoção
 def extrair_id_remocao(texto):
-    # Procura por padrões como "remover 1", "excluir id 5", etc.
     padroes = [
         r'remover\s+(\d+)',
         r'excluir\s+(\d+)',
@@ -188,14 +339,13 @@ def extrair_id_remocao(texto):
                 continue
     return None
 
-# Função para salvar contexto da conversa
+# Funções de contexto
 def salvar_contexto(numero, intencao, dados=None):
     conn = sqlite3.connect(db_file)
     c = conn.cursor()
     
     dados_json = json.dumps(dados) if dados else None
     
-    # Verifica se já existe contexto para este número
     c.execute("SELECT id FROM contexto WHERE numero = ?", (numero,))
     existe = c.fetchone()
     
@@ -209,7 +359,6 @@ def salvar_contexto(numero, intencao, dados=None):
     conn.commit()
     conn.close()
 
-# Função para recuperar contexto
 def recuperar_contexto(numero):
     conn = sqlite3.connect(db_file)
     c = conn.cursor()
@@ -225,111 +374,63 @@ def recuperar_contexto(numero):
         return intencao, dados
     return None, None
 
-# Função para listar gastos com IDs para remoção
+# Funções de gerenciamento de gastos
 def listar_gastos_para_remocao(conn, limite=10):
     c = conn.cursor()
     c.execute("SELECT id, valor, descricao, categoria, data FROM gastos ORDER BY data DESC, id DESC LIMIT ?", (limite,))
-    gastos = c.fetchall()
-    return gastos
+    return c.fetchall()
 
-# Função para remover gasto por ID
 def remover_gasto(conn, id_gasto):
     c = conn.cursor()
-    
-    # Primeiro verifica se o gasto existe
     c.execute("SELECT id, valor, descricao FROM gastos WHERE id = ?", (id_gasto,))
     gasto = c.fetchone()
     
     if gasto:
-        # Remove o gasto
         c.execute("DELETE FROM gastos WHERE id = ?", (id_gasto,))
         conn.commit()
         return True, gasto
-    else:
-        return False, None
+    return False, None
 
-# Sistema de análise e insights
-def gerar_insights(conn, numero):
+# Sistema de análise com ML
+def gerar_insights_ml(conn, numero):
     c = conn.cursor()
     
-    # Gastos do mês atual
+    # Atualiza modelos ML
+    dados_treinados = categorizador_ml.treinar_com_dados(conn)
+    predictor_ml.analisar_historico(conn)
+    recomendador_ml.analisar_padroes(conn)
+    
+    # Insights básicos
     mes_atual = datetime.now().strftime("%Y-%m")
     c.execute("SELECT SUM(valor) FROM gastos WHERE substr(data,1,7)=?", (mes_atual,))
     total_mes = c.fetchone()[0] or 0
     
-    # Gastos por categoria
     c.execute("SELECT categoria, SUM(valor) FROM gastos WHERE substr(data,1,7)=? GROUP BY categoria ORDER BY SUM(valor) DESC", 
              (mes_atual,))
     gastos_por_categoria = c.fetchall()
     
-    # Comparativo com mês anterior
-    mes_anterior = (datetime.now().replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
-    c.execute("SELECT SUM(valor) FROM gastos WHERE substr(data,1,7)=?", (mes_anterior,))
-    total_mes_anterior = c.fetchone()[0] or 0
-    
-    # Geração de insights
     insights = []
     
     if gastos_por_categoria:
         categoria_maior = gastos_por_categoria[0]
         insights.append(f"💡 Sua maior despesa este mês foi em {categoria_maior[0]}: R$ {categoria_maior[1]:.2f}")
     
-    if total_mes_anterior > 0:
-        variacao = ((total_mes - total_mes_anterior) / total_mes_anterior) * 100
-        if variacao > 0:
-            insights.append(f"📈 Seus gastos aumentaram {variacao:.1f}% em relação ao mês anterior")
-        else:
-            insights.append(f"📉 Seus gastos diminuíram {abs(variacao):.1f}% em relação ao mês anterior")
+    # Previsão com ML
+    if predictor_ml.analisar_historico(conn):
+        previsao, tendencia = predictor_ml.prever_proximos_dias(7)
+        if previsao:
+            if tendencia > 5:
+                insights.append(f"📈 Tendência de alta: seus gastos aumentaram {tendencia:.1f}% na última semana")
+            elif tendencia < -5:
+                insights.append(f"📉 Tendência de baixa: seus gastos diminuíram {abs(tendencia):.1f}% na última semana")
+            
+            insights.append(f"🔮 Previsão para próxima semana: R$ {previsao:.2f}")
     
-    # Verifica orçamentos
-    c.execute("SELECT categoria, limite_mensal FROM orcamentos WHERE mes_ano=?", (mes_atual,))
-    orcamentos = c.fetchall()
-    
-    for categoria, limite in orcamentos:
-        c.execute("SELECT SUM(valor) FROM gastos WHERE categoria=? AND substr(data,1,7)=?", 
-                 (categoria, mes_atual))
-        gasto_categoria = c.fetchone()[0] or 0
-        
-        if gasto_categoria > limite:
-            percentual = (gasto_categoria / limite) * 100
-            insights.append(f"⚠️ Você excedeu o orçamento de {categoria} em {percentual:.1f}%!")
-        elif gasto_categoria > limite * 0.8:
-            insights.append(f"🔔 Você está perto de atingir o limite de {categoria}")
+    # Recomendações com ML
+    recomendacoes_ml = recomendador_ml.obter_recomendacoes(2)
+    insights.extend(recomendacoes_ml)
     
     return insights
-
-# Sistema de recomendações personalizadas
-def gerar_recomendacoes(conn, numero):
-    c = conn.cursor()
-    
-    # Análise de padrões de gastos
-    c.execute("SELECT categoria, SUM(valor) FROM gastos GROUP BY categoria ORDER BY SUM(valor) DESC")
-    categorias = c.fetchall()
-    
-    recomendacoes = []
-    
-    if categorias:
-        categoria_maior = categorias[0][0]
-        recomendacoes.append(f"💡 Considere reduzir gastos com {categoria_maior}, sua maior categoria de despesas")
-    
-    # Verifica gastos frequentes
-    c.execute("SELECT descricao, COUNT(*) as freq FROM gastos GROUP BY descricao HAVING freq > 3 ORDER BY freq DESC")
-    gastos_frequentes = c.fetchall()
-    
-    if gastos_frequentes:
-        recomendacoes.append("💡 Você tem alguns gastos muito frequentes. Avalie si são realmente necessários")
-    
-    # Sugestões genéricas
-    sugestoes = [
-        "💡 Experimente definir orçamentos por categoria para controlar melhor seus gastos",
-        "💡 Estabeleça metas financeiras para manter o foco em seus objetivos",
-        "💡 Revise assinaturas e serviços recorrentes - você realmente usa todos?",
-        "💡 Compare preços antes de compras importantes para economizar"
-    ]
-    
-    recomendacoes.extend(random.sample(sugestoes, 2))
-    
-    return recomendacoes
 
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp_bot():
@@ -341,36 +442,41 @@ def whatsapp_bot():
         conn = sqlite3.connect(db_file)
         c = conn.cursor()
         
-        # Processa a mensagem com NLP avançado
-        intencao = analisar_intencao(msg_recebida)
+        # Recupera histórico de intenções para ML contextual
+        c.execute("SELECT ultima_intencao FROM contexto WHERE numero = ? ORDER BY timestamp DESC LIMIT 10", (numero,))
+        historico_intencoes = [row[0] for row in c.fetchall() if row[0]]
+        
+        # Processa a mensagem com ML
+        intencao = analisar_intencao_com_ml(msg_recebida, historico_intencoes)
         ultima_intencao, contexto = recuperar_contexto(numero)
         
-        # Extrai valor e descrição se relevantes
+        # Extrai dados da mensagem
         valor = extrair_valor(msg_recebida)
         descricao = extrair_descricao(msg_recebida)
         
-        # Sistema de diálogo contextual
+        # Sistema de diálogo com ML
         if intencao == "saudacao":
             saudacoes = ["Olá! 👋", "Oi! 😊", "E aí! 👍", "Hello! 👋"]
-            resposta.message(f"{random.choice(saudacoes)} Sou seu assistente financeiro inteligente. Como posso ajudar?")
+            resposta.message(f"{random.choice(saudacoes)} Sou seu assistente financeiro com IA. Como posso ajudar?")
             
         elif intencao == "adicionar_gasto":
             if valor:
-                categoria = categorizar_gasto(descricao) if descricao else "outros"
+                # Usa ML para categorização
+                categoria = categorizador_ml.prever_categoria(descricao) if descricao else "outros"
                 
                 if not descricao:
-                    # Pede descrição se não foi fornecida
                     salvar_contexto(numero, "aguardando_descricao", {"valor": valor})
                     resposta.message(f"💵 Valor identificado: R$ {valor:.2f}. Por favor, digite a descrição deste gasto.")
                 else:
-                    # Adiciona o gasto completo
                     hoje = datetime.now().isoformat()
                     c.execute("INSERT INTO gastos (valor, descricao, categoria, data) VALUES (?, ?, ?, ?)",
                              (valor, descricao, categoria, hoje))
                     conn.commit()
                     
-                    # Gera insights após adicionar gasto
-                    insights = gerar_insights(conn, numero)
+                    # Atualiza modelos ML com novo dado
+                    categorizador_ml.treinar_com_dados(conn)
+                    
+                    insights = gerar_insights_ml(conn, numero)
                     msg_insights = "\n".join(insights) if insights else ""
                     
                     resposta.message(f"✅ Gasto de R$ {valor:.2f} adicionado em {categoria}: {descricao}\n\n{msg_insights}")
@@ -397,12 +503,13 @@ def whatsapp_bot():
                 resposta.message("Nenhum gasto registrado ainda.")
         
         elif intencao == "resumo_financeiro":
-            # Resumo do mês atual
+            # Gera relatório com insights de ML
+            insights = gerar_insights_ml(conn, numero)
+            
             mes_atual = datetime.now().strftime("%Y-%m")
             c.execute("SELECT SUM(valor) FROM gastos WHERE substr(data,1,7)=?", (mes_atual,))
             total_mes = c.fetchone()[0] or 0
             
-            # Gastos por categoria
             c.execute("SELECT categoria, SUM(valor) FROM gastos WHERE substr(data,1,7)=? GROUP BY categoria", 
                      (mes_atual,))
             gastos_categorias = c.fetchall()
@@ -416,12 +523,43 @@ def whatsapp_bot():
                     percentual = (val / total_mes * 100) if total_mes > 0 else 0
                     msg += f"• {cat}: R$ {val:.2f} ({percentual:.1f}%)\n"
             
-            # Adiciona insights
-            insights = gerar_insights(conn, numero)
             if insights:
-                msg += f"\n🔍 Insights:\n" + "\n".join(insights)
+                msg += f"\n🔍 Insights de IA:\n" + "\n".join(insights)
             
             resposta.message(msg)
+        
+        elif intencao == "previsao_gastos":
+            if predictor_ml.analisar_historico(conn):
+                previsao_7_dias, tendencia = predictor_ml.prever_proximos_dias(7)
+                previsao_30_dias, _ = predictor_ml.prever_proximos_dias(30)
+                
+                msg = "🔮 Previsão de Gastos (Machine Learning)\n\n"
+                msg += f"📊 Próximos 7 dias: R$ {previsao_7_dias:.2f}\n"
+                msg += f"📅 Próximos 30 dias: R$ {previsao_30_dias:.2f}\n"
+                
+                if tendencia > 5:
+                    msg += f"📈 Tendência: Alta ({tendencia:.1f}%)\n"
+                elif tendencia < -5:
+                    msg += f"📉 Tendência: Baixa ({abs(tendencia):.1f}%)\n"
+                else:
+                    msg += f"📊 Tendência: Estável ({tendencia:.1f}%)\n"
+                
+                # Adiciona recomendações baseadas na previsão
+                if previsao_30_dias > 1000:
+                    msg += "\n💡 Recomendação: Considere revisar gastos não essenciais"
+                elif previsao_30_dias < 500:
+                    msg += "\n💡 Recomendação: Bom controle financeiro!"
+                
+                resposta.message(msg)
+            else:
+                resposta.message("📊 Preciso de mais dados para fazer previsões precisas. Continue registrando seus gastos!")
+        
+        elif intencao == "treinar_ml":
+            dados_treinados = categorizador_ml.treinar_com_dados(conn)
+            predictor_ml.analisar_historico(conn)
+            recomendador_ml.analisar_padroes(conn)
+            
+            resposta.message(f"🤖 Modelos de ML treinados com {dados_treinados} registros!\n\nSistema de IA atualizado e melhorado.")
         
         elif intencao == "buscar_gastos":
             termos = re.sub(r'(buscar|procurar|encontrar|filtrar|pesquisar)', '', msg_recebida, flags=re.IGNORECASE)
@@ -449,28 +587,10 @@ def whatsapp_bot():
             else:
                 resposta.message("Por favor, digite o que deseja buscar. Ex: 'buscar gastos com mercado'")
         
-        elif intencao == "analise_categoria":
-            c.execute("SELECT categoria, SUM(valor) FROM gastos GROUP BY categoria ORDER BY SUM(valor) DESC")
-            categorias = c.fetchall()
-            
-            if categorias:
-                msg = "📊 Análise por Categoria:\n\n"
-                total_geral = sum(val for _, val in categorias)
-                
-                for cat, val in categorias:
-                    percentual = (val / total_geral * 100) if total_geral > 0 else 0
-                    msg += f"• {cat}: R$ {val:.2f} ({percentual:.1f}%)\n"
-                
-                resposta.message(msg)
-            else:
-                resposta.message("Nenhum gasto registrado para análise.")
-        
         elif intencao == "remover_gasto":
-            # Tenta extrair o ID do gasto a ser removido
             id_gasto = extrair_id_remocao(msg_recebida)
             
             if id_gasto:
-                # Tenta remover o gasto
                 sucesso, gasto = remover_gasto(conn, id_gasto)
                 
                 if sucesso:
@@ -479,7 +599,6 @@ def whatsapp_bot():
                 else:
                     resposta.message(f"❌ Não foi encontrado nenhum gasto com o ID #{id_gasto}.\n\nDigite 'listar' para ver seus gastos disponíveis.")
             else:
-                # Se não encontrou ID, lista os gastos para o usuário escolher
                 gastos = listar_gastos_para_remocao(conn)
                 
                 if gastos:
@@ -494,90 +613,27 @@ def whatsapp_bot():
                 else:
                     resposta.message("Nenhum gasto registrado para remover.")
         
-        elif intencao == "definir_orcamento":
-            # Extrai categoria e valor do orçamento
-            partes = msg_recebida.split()
-            try:
-                valor_orcamento = extrair_valor(msg_recebida)
-                categoria = None
-                
-                # Tenta identificar a categoria
-                for cat in CATEGORIAS.keys():
-                    if cat in msg_recebida.lower():
-                        categoria = cat
-                        break
-                
-                if not categoria:
-                    categoria = "outros"
-                
-                mes_ano = datetime.now().strftime("%Y-%m")
-                
-                # Verifica se já existe orçamento para esta categoria no mês
-                c.execute("SELECT id FROM orcamentos WHERE categoria=? AND mes_ano=?", (categoria, mes_ano))
-                existe = c.fetchone()
-                
-                if existe:
-                    c.execute("UPDATE orcamentos SET limite_mensal=? WHERE categoria=? AND mes_ano=?", 
-                             (valor_orcamento, categoria, mes_ano))
-                else:
-                    c.execute("INSERT INTO orcamentos (categoria, limite_mensal, mes_ano) VALUES (?, ?, ?)",
-                             (categoria, valor_orcamento, mes_ano))
-                
-                conn.commit()
-                resposta.message(f"✅ Orçamento de R$ {valor_orcamento:.2f} definido para {categoria} neste mês.")
-            except Exception as e:
-                resposta.message("Formato inválido. Use: 'definir orçamento de 500 reais para alimentação'")
-        
-        elif intencao == "definir_meta":
-            # Implementação simplificada para metas
-            valor_meta = extrair_valor(msg_recebida)
-            
-            if valor_meta:
-                # Extrai descrição da meta
-                desc_meta = re.sub(r'\d+[\.,]?\d*|r\$|reais|meta|objetivo', '', msg_recebida, flags=re.IGNORECASE)
-                desc_meta = desc_meta.strip()
-                
-                if not desc_meta:
-                    desc_meta = "Economia"
-                
-                data_limite = (datetime.now() + timedelta(days=30)).isoformat()  # 30 dias padrão
-                
-                c.execute("INSERT INTO metas (objetivo, valor_alvo, valor_atual, data_limite) VALUES (?, ?, ?, ?)",
-                         (desc_meta, valor_meta, 0, data_limite))
-                conn.commit()
-                
-                resposta.message(f"🎯 Meta definida: {desc_meta} - R$ {valor_meta:.2f}\n\nVocê pode acompanhar seu progresso a qualquer momento!")
-            else:
-                resposta.message("Por favor, especifique o valor da meta. Ex: 'quero economizar 1000 reais para uma viagem'")
-        
-        elif intencao == "recomendacao":
-            recomendacoes = gerar_recomendacoes(conn, numero)
-            msg = "💡 Recomendações Personalizadas:\n\n" + "\n".join(recomendacoes)
-            resposta.message(msg)
-        
         elif intencao == "ajuda":
             resposta.message(
-                "🤖 *Assistente Financeiro Inteligente* 🤖\n\n"
+                "🤖 *Assistente Financeiro com IA* 🤖\n\n"
                 "💳 *Registrar Gastos:*\n"
-                "- 'Gastei 50 no almoço'\n- 'Adicionar 30 de transporte'\n- 'Comprei um livro por 25 reais'\n\n"
+                "- 'Gastei 50 no almoço'\n- 'Adicionar 30 de transporte'\n\n"
                 "📊 *Consultas e Análises:*\n"
-                "- 'Mostrar meus gastos'\n- 'Resumo financeiro'\n- 'Quanto gastei esse mês?'\n"
-                "- 'Onde gastei mais?'\n- 'Buscar gastos com mercado'\n\n"
+                "- 'Mostrar meus gastos'\n- 'Resumo financeiro'\n- 'Previsão de gastos'\n\n"
+                "🔮 *Machine Learning:*\n"
+                "- 'Previsão próxima semana'\n- 'Treinar IA'\n- 'Onde gastei mais?'\n\n"
                 "🗑️ *Gerenciar Gastos:*\n"
-                "- 'Remover gasto 5'\n- 'Excluir gasto 3'\n- 'Listar gastos'\n\n"
+                "- 'Remover gasto 5'\n- 'Excluir gasto 3'\n\n"
                 "🎯 *Controle Financeiro:*\n"
-                "- 'Definir orçamento de 500 para alimentação'\n- 'Criar meta de 1000 reais'\n"
-                "- 'Recomendações para economizar'\n\n"
-                "💡 *Dica:* Você pode conversar naturalmente comigo!"
+                "- 'Definir orçamento para alimentação'\n- 'Criar meta de viagem'\n\n"
+                "💡 *Dica:* Quanto mais você usar, mais inteligente eu fico!"
             )
         
         else:
-            # Resposta para mensagens não reconhecidas
             respostas_nao_reconhecidas = [
                 "Desculpe, não entendi. Pode reformular?",
                 "Não consegui processar sua solicitação. Pode tentar de outra forma?",
                 "Hmm, não sei como ajudar com isso. Que tal um comando diferente?",
-                "Interessante! Mas não tenho essa funcionalidade ainda."
             ]
             resposta.message(f"{random.choice(respostas_nao_reconhecidas)}\n\nDigite 'ajuda' para ver o que posso fazer.")
         
@@ -588,11 +644,17 @@ def whatsapp_bot():
         return str(resposta)
     
     except Exception as e:
-        # Log do erro para debugging
         print(f"Erro: {str(e)}")
         resposta = MessagingResponse()
         resposta.message("😕 Ocorreu um erro inesperado. Por favor, tente novamente.")
         return str(resposta)
 
 if __name__ == "__main__":
+    # Treina modelos ML inicialmente
+    conn = sqlite3.connect(db_file)
+    categorizador_ml.treinar_com_dados(conn)
+    predictor_ml.analisar_historico(conn)
+    recomendador_ml.analisar_padroes(conn)
+    conn.close()
+    
     app.run(debug=True, port=5000)
